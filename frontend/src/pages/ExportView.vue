@@ -14,6 +14,7 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useMoldStore } from '@/stores/moldStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
 import { exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
 import { useIdbTable } from '@/hooks/useIdbTable'
@@ -24,6 +25,7 @@ const router = useRouter()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
 const furnaceStore = useFurnaceStore()
+const moldStore = useMoldStore()
 
 const { rows, loading, create, update, remove } = useIdbTable<Inspect>(db.inspects, { sortByUpdatedAt: false })
 
@@ -88,6 +90,7 @@ onMounted(() => {
   void pieceStore.loadAll()
   void annealStore.loadAll()
   void furnaceStore.loadAll()
+  void moldStore.loadAll()
 })
 
 function openCreate(): void {
@@ -165,6 +168,7 @@ function handleExportCsv(): void {
     pieceStore.steps,
     annealStore.anneals,
     rows.value,
+    moldStore.effectiveMolds,
   )
   ElMessage.success(`已导出窑务排产汇总 ${filename}`)
 }
@@ -179,19 +183,22 @@ async function handleImport(uploadFile: UploadFile): Promise<void> {
     return
   }
   await importSnapshot(result.snapshot)
-  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+  // 旧库残留的待补写台账变更不得写回新库
+  moldStore.dropPending()
+  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), moldStore.loadAll()])
   ElMessage.success(`导入成功：${result.message}`)
 }
 
 function handleReset(): void {
   ElMessageBox.confirm(
-    '全部窑炉、料液批次、作品、工序、退火与检验记录都会被清空，并重新灌入演示数据。',
+    '全部窑炉、料液批次、作品、工序、模具台账、退火与检验记录都会被清空，并重新灌入演示数据。',
     '确认重置本地数据？',
     { type: 'warning', confirmButtonText: '确认重置', cancelButtonText: '取消' },
   )
     .then(async () => {
       await resetDatabase()
-      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+      moldStore.dropPending()
+      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), moldStore.loadAll()])
       ElMessage.success('已重置为演示数据')
     })
     .catch(() => undefined)
@@ -221,8 +228,10 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         :suffix="`· ${DB_NAME}`"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+        hint="IndexedDB 库名与结构版本；v3 新增模具台账，并为旧开模工序按作品当时使用的模具回填编号，填不上的只读"
       />
+      <StatBadge label="模具台账" :value="moldStore.effectiveMolds.length" suffix="副" tone="primary" icon="DataLine" />
+      <StatBadge label="模具对账挂起" :value="moldStore.heldMolds.length" suffix="副" tone="danger" icon="Warning" />
     </div>
 
     <el-alert

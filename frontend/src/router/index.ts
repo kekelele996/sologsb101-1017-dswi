@@ -9,6 +9,7 @@ export const ROUTES = {
   furnaces: '/furnaces',
   pieces: '/pieces',
   steps: (pieceId: string): string => `/pieces/${pieceId}/steps`,
+  molds: '/molds',
   annealing: '/annealing',
   export: '/export',
 } as const
@@ -20,6 +21,12 @@ const routes: RouteRecordRaw[] = [
     name: 'furnace-list',
     component: () => import('@/pages/FurnaceList.vue'),
     meta: { title: '窑炉与料液台账' },
+  },
+  {
+    path: '/molds',
+    name: 'mold-ledger',
+    component: () => import('@/pages/MoldLedger.vue'),
+    meta: { title: '模具台账与开模对账' },
   },
   {
     path: '/pieces',

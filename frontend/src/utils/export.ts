@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { Mold } from '../types/mold'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
 
@@ -67,13 +68,30 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     }
   }
+  // molds 为 v3 新增：旧版存档（v2）可缺省，导入时按空台账处理
   const keys: Array<keyof DatabaseSnapshot> = ['furnaces', 'batches', 'pieces', 'steps', 'anneals', 'inspects']
   for (const key of keys) {
     if (!Array.isArray(data[key])) {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  if (data.molds !== undefined && !Array.isArray(data.molds)) {
+    return { ok: false, message: '存档 molds 字段必须是数组。', snapshot: null }
+  }
+  // v2 旧存档没有 molds：按空模具台账导入；工序上的模具字段以行内缺省值为准
+  const normalized: DatabaseSnapshot = {
+    name: data.name as string,
+    schemaVersion: data.schemaVersion as number,
+    exportedAt: typeof data.exportedAt === 'string' ? data.exportedAt : '',
+    furnaces: data.furnaces as DatabaseSnapshot['furnaces'],
+    batches: data.batches as DatabaseSnapshot['batches'],
+    pieces: data.pieces as DatabaseSnapshot['pieces'],
+    steps: data.steps as DatabaseSnapshot['steps'],
+    anneals: data.anneals as DatabaseSnapshot['anneals'],
+    inspects: data.inspects as DatabaseSnapshot['inspects'],
+    molds: (data.molds ?? []) as Mold[],
+  }
+  return { ok: true, message: '存档校验通过。', snapshot: normalized }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
@@ -84,7 +102,9 @@ export function buildScheduleCsv(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  molds: Mold[] = [],
 ): string {
+  const moldCodeOf = (moldId: string): string => molds.find((row) => row.id === moldId)?.code ?? '—'
   const header = [
     '作品名',
     '工艺',
@@ -97,6 +117,8 @@ export function buildScheduleCsv(
     '工序数',
     '已完成工序',
     '累计工时(分钟)',
+    '开模模具编号',
+    '开模时台账已用次数',
     '退火记录数',
     '退火窑位',
     '退火状态',
@@ -109,6 +131,18 @@ export function buildScheduleCsv(
     const batch = batches.find((row) => row.id === piece.batchId)
     const furnace = furnaces.find((row) => row.id === batch?.furnaceId)
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
+    const openSteps = pieceSteps.filter((row) => row.name === '开模')
+    const moldCodes = Array.from(
+      new Set(
+        openSteps
+          .map((row) => (row.legacyReadonly ? '历史未记录（只读）' : moldCodeOf(row.moldId)))
+          .filter((code) => code !== '—'),
+      ),
+    ).join(' / ')
+    const pickUsed = openSteps
+      .filter((row) => !row.legacyReadonly && row.moldId !== '')
+      .map((row) => `${moldCodeOf(row.moldId)}:${row.moldUsedAtPick}`)
+      .join(' / ')
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
@@ -126,6 +160,8 @@ export function buildScheduleCsv(
         pieceSteps.length,
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
+        moldCodes === '' ? '—' : moldCodes,
+        pickUsed === '' ? '—' : pickUsed,
         pieceAnneals.length,
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
@@ -148,9 +184,14 @@ export function exportScheduleCsvFile(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  molds: Mold[] = [],
 ): string {
   const filename = `玻璃窑务排产汇总-${stampSuffix()}.csv`
-  download(filename, buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects), 'text/csv;charset=utf-8')
+  download(
+    filename,
+    buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects, molds),
+    'text/csv;charset=utf-8',
+  )
   return filename
 }
 
@@ -174,7 +215,9 @@ export function buildStepCardText(
   furnace: Furnace | undefined,
   steps: Step[],
   anneals: Anneal[],
+  molds: Mold[] = [],
 ): string {
+  const moldCodeOf = (moldId: string): string => molds.find((row) => row.id === moldId)?.code ?? '未知编号'
   const lines: string[] = []
   lines.push(`【工序卡片】${piece.name}（${piece.craft} · ${piece.artist} · ${piece.state}）`)
   lines.push(`设计尺寸：高 ${piece.designHeightMm} mm / 壁厚 ${piece.wallThicknessMm} mm`)
@@ -191,10 +234,20 @@ export function buildStepCardText(
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .forEach((row) => {
+      const moldPart =
+        row.name !== '开模'
+          ? ''
+          : row.legacyReadonly
+            ? ' · 模具编号缺失（历史遗留只读）'
+            : row.moldId === ''
+              ? ' · 未绑定模具'
+              : ` · 模具 ${moldCodeOf(row.moldId)}（挑模时台账已用 ${row.moldUsedAtPick} 次）`
       lines.push(
         `  ${row.seq}. ${row.name} · ${row.tempC} ℃ · ${row.durationMin} 分钟 · ${row.operator} · ${
           row.state
-        }${row.remark === '' ? '' : ` · ${row.remark}`}`,
+        }${moldPart}${row.remark === '' ? '' : ` · ${row.remark}`}${
+          row.rejectReason === '' ? '' : ` · 退回原因：${row.rejectReason}`
+        }`,
       )
     })
   if (anneals.length > 0) {

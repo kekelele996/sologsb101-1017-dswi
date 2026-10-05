@@ -12,15 +12,26 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
+import { useMoldStore } from '@/stores/moldStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
+import {
+  OPEN_STEP_NAME,
+  STEP_NAME_OPTIONS,
+  STEP_STATE_OPTIONS,
+  type Step,
+  type StepDraft,
+  type StepName,
+  type StepState,
+} from '@/types/step'
 import { buildStepCardText, copyText } from '@/utils/export'
+import { checkMoldUsable, moldStatus, remainUses } from '@/utils/mold'
 import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
 
 const route = useRoute()
 const router = useRouter()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const moldStore = useMoldStore()
 
 const pieceId = computed<string>(() => String(route.params.id ?? ''))
 const piece = computed(() => pieceStore.pieces.find((row) => row.id === pieceId.value) ?? null)
@@ -42,18 +53,39 @@ const form = reactive<StepDraft>({
   operator: '',
   remark: '',
   state: '未开始',
+  moldId: '',
 })
 
-const rules: FormRules<StepDraft> = {
+const rules = computed<FormRules<StepDraft>>(() => ({
   seq: [{ required: true, message: '请填写工序序号', trigger: 'blur' }],
   name: [{ required: true, message: '请选择工序名称', trigger: 'change' }],
   tempC: [{ required: true, message: '请填写工序温度', trigger: 'blur' }],
   durationMin: [{ required: true, message: '请填写时长', trigger: 'blur' }],
   operator: [{ required: true, message: '请填写操作人', trigger: 'blur' }],
   state: [{ required: true, message: '请选择工序状态', trigger: 'change' }],
-}
+  moldId:
+    form.name === OPEN_STEP_NAME
+      ? [{ required: true, message: '开模工序必须挑一副未报废、次数未用尽的模具', trigger: 'change' }]
+      : [],
+}))
 
 const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
+
+/** 可挑模具 + 编辑中已绑定但已不可用的模具（标注状态，仍允许保留原绑定） */
+const moldOptions = computed(() => {
+  const usable = moldStore.usableMolds
+  const bound = form.moldId === '' ? undefined : moldStore.moldById(form.moldId)
+  if (bound !== undefined && !usable.some((row) => row.id === bound.id)) {
+    return [...usable, bound]
+  }
+  return usable
+})
+
+const selectedMold = computed(() => (form.moldId === '' ? undefined : moldStore.moldById(form.moldId)))
+
+function moldCodeOf(id: string): string {
+  return moldStore.moldById(id)?.code ?? '未知编号'
+}
 
 const batch = computed(() =>
   piece.value === null ? undefined : furnaceStore.batches.find((row) => row.id === piece.value?.batchId)
@@ -72,8 +104,13 @@ const currentStep = computed<Step | null>(() => steps.value.find((row) => row.st
 
 onMounted(() => {
   void furnaceStore.loadAll()
+  void moldStore.loadAll()
   void pieceStore.loadAll()
 })
+
+function resetMoldIfNeeded(): void {
+  if (form.name !== OPEN_STEP_NAME) form.moldId = ''
+}
 
 function openCreate(): void {
   editingId.value = null
@@ -87,6 +124,7 @@ function openCreate(): void {
     operator: currentStep.value?.operator ?? '',
     remark: '',
     state: '未开始' as StepState,
+    moldId: '',
   })
   dialogVisible.value = true
 }
@@ -102,6 +140,7 @@ function openEdit(row: Step): void {
     operator: row.operator,
     remark: row.remark,
     state: row.state,
+    moldId: row.moldId,
   })
   dialogVisible.value = true
 }
@@ -113,14 +152,25 @@ async function handleSubmit(): Promise<void> {
   if (!tempCheck.value.ok) {
     ElMessage.warning(tempCheck.value.message)
   }
+  // 开模：保存前再次确认所挑模具没报废、次数没用完，并快照台账当时已用次数
+  let moldUsedAtPick = 0
+  if (form.name === OPEN_STEP_NAME) {
+    if (form.moldId === '') return
+    const mold = moldStore.moldById(form.moldId)
+    const check = checkMoldUsable(mold)
+    if (!check.ok) {
+      ElMessage.error(check.reason)
+      return
+    }
+    if (mold !== undefined) moldUsedAtPick = mold.usedCount + (moldStore.pendingDeltaMap[mold.id] ?? 0)
+  }
   submitting.value = true
   try {
-    if (editingId.value === null) {
-      await pieceStore.createStep({ ...form })
-      ElMessage.success(`已新增第 ${form.seq} 道「${form.name}」`)
+    const result = await pieceStore.saveStepDraft({ ...form, moldUsedAtPick }, editingId.value)
+    if (result.rejected) {
+      ElMessage.warning(result.message)
     } else {
-      await pieceStore.updateStep(editingId.value, { ...form })
-      ElMessage.success('工序已更新')
+      ElMessage.success(result.message)
     }
     dialogVisible.value = false
   } finally {
@@ -129,6 +179,10 @@ async function handleSubmit(): Promise<void> {
 }
 
 async function handleDelete(row: Step): Promise<void> {
+  if (row.legacyReadonly) {
+    ElMessage.warning('历史遗留开模工序只读，不能删除')
+    return
+  }
   try {
     await ElMessageBox.confirm(`确认删除第 ${row.seq} 道「${row.name}」？`, '删除确认', {
       type: 'warning',
@@ -139,12 +193,12 @@ async function handleDelete(row: Step): Promise<void> {
     return
   }
   await pieceStore.deleteStep(row.id)
-  ElMessage.success('工序已删除')
+  ElMessage.success(pieceStore.lastMessage || '工序已删除')
 }
 
 async function handleAdvance(row: Step): Promise<void> {
-  await pieceStore.advanceStep(row.id)
-  ElMessage.success(pieceStore.lastMessage)
+  const result = await pieceStore.advanceStep(row.id)
+  ElMessage[result.rejected ? 'warning' : 'success'](result.message)
 }
 
 async function handleDrop(targetId: string): Promise<void> {
@@ -158,7 +212,7 @@ async function handleDrop(targetId: string): Promise<void> {
 
 async function handleCopyCard(): Promise<void> {
   if (piece.value === null) return
-  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [])
+  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [], moldStore.effectiveMolds)
   const ok = await copyText(text)
   ElMessage[ok ? 'success' : 'warning'](ok ? '工序卡片已复制到剪贴板' : '当前浏览器不支持剪贴板写入')
 }
@@ -273,15 +327,19 @@ function goAnnealing(): void {
             v-for="(row, index) in steps"
             :key="row.id"
             class="step-item"
-            :class="{ 'is-drag-over': dragOverId === row.id, 'is-current': currentStep?.id === row.id }"
-            draggable="true"
+            :class="{
+              'is-drag-over': dragOverId === row.id,
+              'is-current': currentStep?.id === row.id,
+              'is-legacy': row.legacyReadonly,
+            }"
+            :draggable="!row.legacyReadonly"
             @dragstart="draggingId = row.id"
             @dragover.prevent="dragOverId = row.id"
             @dragleave="dragOverId = null"
             @drop.prevent="handleDrop(row.id)"
           >
             <span class="step-seq">{{ index + 1 }}</span>
-            <span class="step-grip" title="按住拖拽调整工序顺序">⠿</span>
+            <span class="step-grip" :class="{ 'is-readonly': row.legacyReadonly }" title="按住拖拽调整工序顺序">⠿</span>
             <div class="step-main">
               <div class="step-title">
                 <b>{{ row.name }}</b>
@@ -292,24 +350,57 @@ function goAnnealing(): void {
                   {{ row.state }}
                 </el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
+                <el-tag
+                  v-if="row.name === '开模' && row.moldId !== ''"
+                  size="small"
+                  :type="checkMoldUsable(moldStore.moldById(row.moldId)).ok ? 'primary' : 'danger'"
+                  effect="plain"
+                >
+                  模具 {{ moldCodeOf(row.moldId) }} · 挑模时已用 {{ row.moldUsedAtPick }} 次
+                </el-tag>
+                <el-tag v-if="row.name === '开模' && row.moldId === '' && !row.legacyReadonly" size="small" type="warning">
+                  未绑定模具
+                </el-tag>
+                <el-tag v-if="row.legacyReadonly" size="small" type="info" effect="dark">历史遗留 · 只读</el-tag>
               </div>
               <div class="step-sub">
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
               </div>
+              <el-alert
+                v-if="row.legacyReadonly"
+                type="info"
+                show-icon
+                :closable="false"
+                class="step-note"
+                :title="`旧数据未记录模具编号，无法回填，只读保留：${row.legacyReason}`"
+              />
+              <el-alert
+                v-else-if="row.rejectReason !== ''"
+                type="error"
+                show-icon
+                :closable="false"
+                class="step-note"
+                :title="row.rejectReason"
+              />
             </div>
             <div class="step-actions">
-              <el-button
-                size="small"
-                type="primary"
-                plain
-                :disabled="row.state === '已完成'"
-                @click="handleAdvance(row)"
-              >
-                推进状态
-              </el-button>
-              <el-button size="small" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" type="danger" plain @click="handleDelete(row)">删除</el-button>
+              <template v-if="row.legacyReadonly">
+                <el-button size="small" disabled title="历史遗留工序只读">只读</el-button>
+              </template>
+              <template v-else>
+                <el-button
+                  size="small"
+                  type="primary"
+                  plain
+                  :disabled="row.state === '已完成'"
+                  @click="handleAdvance(row)"
+                >
+                  推进状态
+                </el-button>
+                <el-button size="small" @click="openEdit(row)">编辑</el-button>
+                <el-button size="small" type="danger" plain @click="handleDelete(row)">删除</el-button>
+              </template>
             </div>
           </li>
         </ul>
@@ -326,7 +417,11 @@ function goAnnealing(): void {
           </el-col>
           <el-col :span="8">
             <el-form-item label="工序名称" prop="name">
-              <el-select v-model="form.name" style="width: 100%">
+              <el-select
+                v-model="form.name"
+                style="width: 100%"
+                @change="resetMoldIfNeeded"
+              >
                 <el-option v-for="item in STEP_NAME_OPTIONS" :key="item" :value="item" :label="item" />
               </el-select>
             </el-form-item>
@@ -356,6 +451,54 @@ function goAnnealing(): void {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-row v-if="form.name === '开模'" :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="开模模具" prop="moldId">
+              <el-select
+                v-model="form.moldId"
+                filterable
+                style="width: 100%"
+                placeholder="只能挑未报废、次数未用尽的模具"
+              >
+                <el-option
+                  v-for="mold in moldOptions"
+                  :key="mold.id"
+                  :value="mold.id"
+                  :label="`${mold.code} · ${mold.name}（剩余 ${Math.max(0, mold.maxUses - mold.usedCount - (moldStore.pendingDeltaMap[mold.id] ?? 0))} 次）`"
+                >
+                  <span>{{ mold.code }} · {{ mold.name }}</span>
+                  <span style="float: right; color: var(--el-color-info); font-size: 12px">
+                    {{ moldStatus(mold) }} · 剩余 {{ remainUses(mold) }} 次
+                  </span>
+                </el-option>
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="挑模台账快照">
+              <el-tag v-if="selectedMold" type="info" effect="plain">
+                编号 {{ selectedMold.code }} · 保存时记下台账已用
+                {{ selectedMold.usedCount + (moldStore.pendingDeltaMap[selectedMold.id] ?? 0) }}/{{ selectedMold.maxUses }}
+                次
+              </el-tag>
+              <span v-else class="cell-sub">挑中模具后自动记录编号与当时已用次数</span>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-alert
+          v-if="form.name === '开模'"
+          :type="selectedMold === undefined ? 'info' : checkMoldUsable(selectedMold).ok ? 'success' : 'error'"
+          show-icon
+          :closable="false"
+          class="mb-14"
+          :title="
+            selectedMold === undefined
+              ? '开模只能挑没报废、次数没用完的模具；完成开模时若模具已报废或用尽，本道退回未开始并写明原因，前面确认过的工序照旧。'
+              : checkMoldUsable(selectedMold).reason === ''
+                ? `模具「${selectedMold.code}」当前可用，剩余 ${remainUses(selectedMold)} 次；开模完成后台账已用次数 +1。`
+                : checkMoldUsable(selectedMold).reason
+          "
+        />
         <el-form-item label="备注">
           <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="如：分三次吹气成型 / 夹持颈部收细" />
         </el-form-item>

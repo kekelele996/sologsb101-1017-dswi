@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Box, DocumentChecked, Odometer, SetUp, Sunrise } from '@element-plus/icons-vue'
+import { Box, DocumentChecked, Files, Odometer, SetUp, Sunrise } from '@element-plus/icons-vue'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { useAnnealStore } from '@/stores/annealStore'
+import { useMoldStore } from '@/stores/moldStore'
 import { ROUTES } from '@/router'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const furnaceStore = useFurnaceStore()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
+const moldStore = useMoldStore()
 
 const navItems = computed(() => {
   const currentPieceId = pieceStore.currentPieceId
   return [
     { path: ROUTES.furnaces, label: '窑炉料液', icon: SetUp, badge: String(furnaceStore.furnaces.length) },
+    { path: ROUTES.molds, label: '模具台账', icon: Files, badge: String(moldStore.effectiveMolds.length) },
     { path: ROUTES.pieces, label: '作品登记', icon: Box, badge: String(pieceStore.pieces.length) },
     {
       path: currentPieceId ? ROUTES.steps(currentPieceId) : ROUTES.pieces,
@@ -46,6 +49,7 @@ const lowRemain = computed<number>(() => furnaceStore.lowRemainBatches.length)
 
 onMounted(() => {
   void furnaceStore.loadAll()
+  void moldStore.loadAll()
   void pieceStore.loadAll()
   void annealStore.loadAll()
 })
@@ -98,10 +102,9 @@ function go(path: string): void {
     <footer class="app-footer">
       <span>数据仅存于本浏览器（IndexedDB 库名 gbglassblow / localStorage），不上传任何服务器。</span>
       <span>
-        窑炉 {{ furnaceStore.furnaces.length }} · 料液 {{ furnaceStore.batches.length }} · 作品
-        {{ pieceStore.pieces.length }} · 工序 {{ pieceStore.steps.length }} · 结构版本 v{{
-          furnaceStore.counts.schemaVersion ?? '-'
-        }}
+        窑炉 {{ furnaceStore.furnaces.length }} · 料液 {{ furnaceStore.batches.length }} · 模具
+        {{ moldStore.effectiveMolds.length }} · 作品 {{ pieceStore.pieces.length }} · 工序
+        {{ pieceStore.steps.length }} · 结构版本 v{{ furnaceStore.counts.schemaVersion ?? '-' }}
       </span>
     </footer>
   </div>
