@@ -30,6 +30,14 @@ export interface Step {
   remark: string
   /** 工序状态 */
   state: StepState
+  /** 开模工序选用的模具 id（仅 name === '开模' 时有值） */
+  moldId: string | null
+  /** 挑中模具时的已用次数（当时已用次数） */
+  moldUsedCount: number | null
+  /** 开模完成时若模具已报废或用尽，退回未开始的原因 */
+  moldInvalidReason: string
+  /** 旧数据无法回填模具编号时标记为只读（不可编辑、不可推进） */
+  readonly: boolean
   createdAt: string
   updatedAt: string
   revision: number
@@ -45,4 +53,5 @@ export interface StepDraft {
   operator: string
   remark: string
   state: StepState
+  moldId: string | null
 }

@@ -5,8 +5,9 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Box, DocumentChecked, Odometer, SetUp, Sunrise } from '@element-plus/icons-vue'
+import { Box, DocumentChecked, Odometer, SetUp, Sunrise, Coin } from '@element-plus/icons-vue'
 import { useFurnaceStore } from '@/stores/furnaceStore'
+import { useMoldStore } from '@/stores/moldStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { useAnnealStore } from '@/stores/annealStore'
 import { ROUTES } from '@/router'
@@ -14,6 +15,7 @@ import { ROUTES } from '@/router'
 const route = useRoute()
 const router = useRouter()
 const furnaceStore = useFurnaceStore()
+const moldStore = useMoldStore()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
 
@@ -30,6 +32,7 @@ const navItems = computed(() => {
       disabled: currentPieceId === null,
     },
     { path: ROUTES.annealing, label: '退火编排', icon: Sunrise, badge: String(annealStore.anneals.length) },
+    { path: ROUTES.molds, label: '模具台账', icon: Coin, badge: String(moldStore.molds.length) },
     { path: ROUTES.export, label: '检验归档', icon: DocumentChecked, badge: String(pieceStore.counts.inspects ?? 0) },
   ]
 })
@@ -43,11 +46,13 @@ const activePath = computed<string>(() => {
 })
 
 const lowRemain = computed<number>(() => furnaceStore.lowRemainBatches.length)
+const suspended = computed<boolean>(() => moldStore.suspended)
 
 onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
   void annealStore.loadAll()
+  void moldStore.loadAll()
 })
 
 function go(path: string): void {
@@ -86,6 +91,7 @@ function go(path: string): void {
         </el-tag>
         <el-tag v-else type="info">未选择作品</el-tag>
         <el-tag v-if="lowRemain > 0" type="danger" effect="dark">待补料 {{ lowRemain }} 批</el-tag>
+        <el-tag v-if="suspended" type="danger" effect="dark">模具对账不平 · 已挂起</el-tag>
       </div>
     </header>
 

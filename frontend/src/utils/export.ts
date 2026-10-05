@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { Mold } from '../types/mold'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
 
@@ -73,7 +74,15 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  // 模具为 v3 新增字段，旧存档可能缺失，缺失时按空数组处理
+  if (data.molds !== undefined && !Array.isArray(data.molds)) {
+    return { ok: false, message: '存档 molds 字段必须是数组。', snapshot: null }
+  }
+  return {
+    ok: true,
+    message: '存档校验通过。',
+    snapshot: { ...data, molds: Array.isArray(data.molds) ? data.molds : [] } as DatabaseSnapshot,
+  }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
@@ -174,6 +183,7 @@ export function buildStepCardText(
   furnace: Furnace | undefined,
   steps: Step[],
   anneals: Anneal[],
+  molds: Mold[] = [],
 ): string {
   const lines: string[] = []
   lines.push(`【工序卡片】${piece.name}（${piece.craft} · ${piece.artist} · ${piece.state}）`)
@@ -191,10 +201,19 @@ export function buildStepCardText(
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .forEach((row) => {
+      const mold = row.moldId === null ? undefined : molds.find((m) => m.id === row.moldId)
+      const moldText =
+        row.name === '开模'
+          ? mold === undefined
+            ? ' · 模具未指定'
+            : ` · 模具 ${mold.code}（已用 ${row.moldUsedCount ?? 0} 次）`
+          : ''
+      const readonlyText = row.readonly ? ' · 只读（旧数据未回填模具）' : ''
+      const reasonText = row.moldInvalidReason === '' ? '' : ` · 退回原因：${row.moldInvalidReason}`
       lines.push(
         `  ${row.seq}. ${row.name} · ${row.tempC} ℃ · ${row.durationMin} 分钟 · ${row.operator} · ${
           row.state
-        }${row.remark === '' ? '' : ` · ${row.remark}`}`,
+        }${moldText}${readonlyText}${reasonText}${row.remark === '' ? '' : ` · ${row.remark}`}`,
       )
     })
   if (anneals.length > 0) {

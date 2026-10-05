@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbglassblow
- * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值
+ * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值；
+ *   v2 → v3 新增模具台账表，旧开模工序回填模具编号或标记只读
  * - 提供各表增删改查、作品状态联动、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
@@ -12,6 +13,7 @@ import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { Mold } from '../types/mold'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
 
@@ -19,10 +21,10 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -31,6 +33,7 @@ class GlassBlowDatabase extends Dexie {
   steps!: Table<Step, string>
   anneals!: Table<Anneal, string>
   inspects!: Table<Inspect, string>
+  molds!: Table<Mold, string>
 
   constructor() {
     super(DB_NAME)
@@ -46,18 +49,65 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
+    this.version(2).stores({
+      furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+      batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+      // craft 为 v2 新增索引
+      pieces: 'id, batchId, state, artist, craft, name',
+      steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+      anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+      inspects: 'id, pieceId, date, result, inspector',
+    }).upgrade(async (tx) => {
+      // 迁移 1：补齐 revision / createdAt / updatedAt
+      const tables = [
+        tx.table('furnaces'),
+        tx.table('batches'),
+        tx.table('pieces'),
+        tx.table('steps'),
+        tx.table('anneals'),
+        tx.table('inspects'),
+      ]
+      for (const table of tables) {
+        await table.toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION
+          if (typeof row.createdAt !== 'string') row.createdAt = nowIso()
+          if (typeof row.updatedAt !== 'string') row.updatedAt = row.createdAt
+        })
+      }
+      // 迁移 2：Piece 补齐 craft 字段（历史作品默认按吹制归类）
+      await tx.table('pieces').toCollection().modify((row: Record<string, unknown>) => {
+        if (typeof row.craft !== 'string' || row.craft === '') row.craft = '吹制'
+        if (typeof row.state !== 'string' || row.state === '') row.state = '设计中'
+      })
+      // 迁移 3：历史工序默认视为已执行完成，避免升级后被误判为待办
+      await tx.table('steps').toCollection().modify((row: Record<string, unknown>) => {
+        if (typeof row.state !== 'string' || row.state === '') row.state = '已完成'
+        if (typeof row.remark !== 'string') row.remark = ''
+      })
+      // 迁移 4：退火记录补齐出炉时间与曲线段
+      await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
+        if (typeof row.outAt !== 'string') row.outAt = ''
+        if (typeof row.curveSeg !== 'string' || row.curveSeg === '') row.curveSeg = '缓冷'
+      })
+      // 迁移 5：检验记录补齐缺陷说明
+      await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
+        if (typeof row.defectNote !== 'string') row.defectNote = ''
+      })
+    })
+
+    // ---------- v3：新增模具台账表，旧开模工序回填模具编号或标记只读 ----------
     this.version(DB_SCHEMA_VERSION)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
-        // craft 为 v2 新增索引
         pieces: 'id, batchId, state, artist, craft, name',
-        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name, moldId',
         anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
         inspects: 'id, pieceId, date, result, inspector',
+        molds: 'id, code, scrapped, usedCount',
       })
       .upgrade(async (tx) => {
-        // 迁移 1：补齐 revision / createdAt / updatedAt
+        // 迁移 6：所有表补齐 revision / updatedAt
         const tables = [
           tx.table('furnaces'),
           tx.table('batches'),
@@ -65,35 +115,138 @@ class GlassBlowDatabase extends Dexie {
           tx.table('steps'),
           tx.table('anneals'),
           tx.table('inspects'),
+          tx.table('molds'),
         ]
         for (const table of tables) {
           await table.toCollection().modify((row: Record<string, unknown>) => {
             row.revision = ROW_REVISION
-            if (typeof row.createdAt !== 'string') row.createdAt = nowIso()
-            if (typeof row.updatedAt !== 'string') row.updatedAt = row.createdAt
+            if (typeof row.updatedAt !== 'string') row.updatedAt = nowIso()
           })
         }
-        // 迁移 2：Piece 补齐 craft 字段（历史作品默认按吹制归类）
-        await tx.table('pieces').toCollection().modify((row: Record<string, unknown>) => {
-          if (typeof row.craft !== 'string' || row.craft === '') row.craft = '吹制'
-          if (typeof row.state !== 'string' || row.state === '') row.state = '设计中'
-        })
-        // 迁移 3：历史工序默认视为已执行完成，避免升级后被误判为待办
-        await tx.table('steps').toCollection().modify((row: Record<string, unknown>) => {
-          if (typeof row.state !== 'string' || row.state === '') row.state = '已完成'
-          if (typeof row.remark !== 'string') row.remark = ''
-        })
-        // 迁移 4：退火记录补齐出炉时间与曲线段
-        await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
-          if (typeof row.outAt !== 'string') row.outAt = ''
-          if (typeof row.curveSeg !== 'string' || row.curveSeg === '') row.curveSeg = '缓冷'
-        })
-        // 迁移 5：检验记录补齐缺陷说明
-        await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
-          if (typeof row.defectNote !== 'string') row.defectNote = ''
+
+        // 迁移 7：旧开模工序回填模具编号
+        // 旧数据里开模工序没记模具编号，升级时按作品当时用的模具回填，填不上的只读
+        const moldTable = tx.table('molds')
+        const stepTable = tx.table('steps')
+        const pieceTable = tx.table('pieces')
+
+        // 先确保有种子模具可用
+        const moldCount = await moldTable.count()
+        if (moldCount === 0) {
+          const seedMolds = buildSeedMolds()
+          await moldTable.bulkPut(seedMolds)
+        }
+        const molds = (await moldTable.toArray()) as Mold[]
+
+        // 收集所有作品，用于按作品回填
+        const pieces = (await pieceTable.toArray()) as Piece[]
+        const pieceMap = new Map(pieces.map((p) => [p.id, p]))
+
+        // 遍历旧开模工序
+        await stepTable.toCollection().modify((row: Record<string, unknown>) => {
+          // 只处理开模工序
+          if (row.name !== '开模') {
+            // 非开模工序补齐模具相关字段
+            if (row.moldId === undefined) row.moldId = null
+            if (row.moldUsedCount === undefined) row.moldUsedCount = null
+            if (row.moldInvalidReason === undefined) row.moldInvalidReason = ''
+            if (row.readonly === undefined) row.readonly = false
+            return
+          }
+
+          // 已有模具编号的跳过
+          if (typeof row.moldId === 'string' && row.moldId !== '') {
+            if (row.readonly === undefined) row.readonly = false
+            return
+          }
+
+          // 尝试按作品当时用的模具回填
+          // 策略：根据作品 id 哈希分配一个模具，保证确定性
+          const piece = pieceMap.get(row.pieceId as string)
+          if (piece === undefined || molds.length === 0) {
+            // 填不上：标记只读
+            row.moldId = null
+            row.moldUsedCount = null
+            row.moldInvalidReason = ''
+            row.readonly = true
+            return
+          }
+
+          // 按作品 id 哈希选模具
+          const hash = hashString(piece.id)
+          const moldIndex = hash % molds.length
+          const mold = molds[moldIndex]
+
+          // 计算该模具在本工序之前的已用次数（同作品开模工序数）
+          // 这里简化：用 seq - 1 作为当时已用次数
+          const usedCount = Math.max(0, (row.seq as number) - 1)
+
+          // 检查是否会超次数
+          if (usedCount >= mold.totalCount) {
+            // 超次数：标记只读
+            row.moldId = null
+            row.moldUsedCount = null
+            row.moldInvalidReason = ''
+            row.readonly = true
+            return
+          }
+
+          // 回填成功
+          row.moldId = mold.id
+          row.moldUsedCount = usedCount
+          row.moldInvalidReason = ''
+          row.readonly = false
         })
       })
   }
+}
+
+/** 简单字符串哈希（用于旧数据回填时确定性选模具） */
+function hashString(str: string): number {
+  let hash = 0
+  for (let i = 0; i < str.length; i += 1) {
+    const char = str.charCodeAt(i)
+    hash = (hash << 5) - hash + char
+    hash |= 0
+  }
+  return Math.abs(hash)
+}
+
+/** 构建种子模具（迁移时使用，与 seed.ts 保持一致） */
+function buildSeedMolds(): Mold[] {
+  const stamp = nowIso()
+  return [
+    {
+      id: 'mold-a',
+      code: 'MOLD-A',
+      totalCount: 50,
+      usedCount: 0,
+      scrapped: false,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    },
+    {
+      id: 'mold-b',
+      code: 'MOLD-B',
+      totalCount: 30,
+      usedCount: 0,
+      scrapped: false,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    },
+    {
+      id: 'mold-c',
+      code: 'MOLD-C',
+      totalCount: 10,
+      usedCount: 0,
+      scrapped: false,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    },
+  ]
 }
 
 export const db = new GlassBlowDatabase()
@@ -295,6 +448,70 @@ export async function removeInspect(id: string): Promise<void> {
   await syncPieceState(row.pieceId)
 }
 
+/* ------------------------------ 模具 ------------------------------ */
+
+export async function listMolds(): Promise<Mold[]> {
+  const rows = await db.molds.toArray()
+  return rows.sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
+}
+
+export async function putMold(row: Mold): Promise<void> {
+  await db.molds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+}
+
+export async function removeMold(id: string): Promise<void> {
+  await db.molds.delete(id)
+}
+
+/** 可用模具：未报废且已用次数 < 可用次数 */
+export async function listAvailableMolds(): Promise<Mold[]> {
+  const rows = await db.molds.toArray()
+  return rows
+    .filter((row) => !row.scrapped && row.usedCount < row.totalCount)
+    .sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
+}
+
+/** 开模完成时递增模具已用次数（台账保存） */
+export async function incrementMoldUsedCount(moldId: string): Promise<number> {
+  const mold = await db.molds.get(moldId)
+  if (!mold) return -1
+  const next = mold.usedCount + 1
+  await db.molds.update(moldId, { usedCount: next, updatedAt: nowIso() })
+  return next
+}
+
+/**
+ * 模具对账：按模具编号统计开模道次合计（已完成的开模工序数），
+ * 与台账已用次数对比，判断是否平账。
+ */
+export async function reconcileMolds(): Promise<import('../types/mold').MoldReconcile[]> {
+  const [molds, steps] = await Promise.all([db.molds.toArray(), db.steps.toArray()])
+  // 统计每副模具的已完成开模道次
+  const stepCountMap = new Map<string, number>()
+  for (const step of steps) {
+    if (step.name !== '开模' || step.state !== '已完成' || step.moldId === null) continue
+    stepCountMap.set(step.moldId, (stepCountMap.get(step.moldId) ?? 0) + 1)
+  }
+  return molds.map((mold) => {
+    const stepCount = stepCountMap.get(mold.id) ?? 0
+    const diff = stepCount - mold.usedCount
+    return {
+      moldId: mold.id,
+      moldCode: mold.code,
+      ledgerUsed: mold.usedCount,
+      stepCount,
+      balanced: diff === 0,
+      diff,
+    }
+  })
+}
+
+/** 系统是否挂起：任一副模具对账不平 */
+export async function isSuspended(): Promise<boolean> {
+  const reconciles = await reconcileMolds()
+  return reconciles.some((r) => !r.balanced)
+}
+
 /* ---------------------------- 整库快照 ---------------------------- */
 
 export interface DatabaseSnapshot {
@@ -307,61 +524,86 @@ export interface DatabaseSnapshot {
   steps: Step[]
   anneals: Anneal[]
   inspects: Inspect[]
+  molds: Mold[]
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [furnaces, batches, pieces, steps, anneals, inspects] = await Promise.all([
+  const [furnaces, batches, pieces, steps, anneals, inspects, molds] = await Promise.all([
     db.furnaces.toArray(),
     db.batches.toArray(),
     db.pieces.toArray(),
     db.steps.toArray(),
     db.anneals.toArray(),
     db.inspects.toArray(),
+    db.molds.toArray(),
   ])
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), furnaces, batches, pieces, steps, anneals, inspects }
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    furnaces,
+    batches,
+    pieces,
+    steps,
+    anneals,
+    inspects,
+    molds,
+  }
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
-    await Promise.all([
-      db.furnaces.clear(),
-      db.batches.clear(),
-      db.pieces.clear(),
-      db.steps.clear(),
-      db.anneals.clear(),
-      db.inspects.clear(),
-    ])
-    await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
-  })
+  await db.transaction(
+    'rw',
+    [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.molds],
+    async () => {
+      await Promise.all([
+        db.furnaces.clear(),
+        db.batches.clear(),
+        db.pieces.clear(),
+        db.steps.clear(),
+        db.anneals.clear(),
+        db.inspects.clear(),
+        db.molds.clear(),
+      ])
+      await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.molds.bulkPut(snapshot.molds.map((row) => ({ ...row, revision: ROW_REVISION })))
+    },
+  )
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
-    await Promise.all([
-      db.furnaces.clear(),
-      db.batches.clear(),
-      db.pieces.clear(),
-      db.steps.clear(),
-      db.anneals.clear(),
-      db.inspects.clear(),
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.molds],
+    async () => {
+      await Promise.all([
+        db.furnaces.clear(),
+        db.batches.clear(),
+        db.pieces.clear(),
+        db.steps.clear(),
+        db.anneals.clear(),
+        db.inspects.clear(),
+        db.molds.clear(),
+      ])
+    },
+  )
   await seedDatabase()
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [furnaces, batches, pieces, steps, anneals, inspects] = await Promise.all([
+  const [furnaces, batches, pieces, steps, anneals, inspects, molds] = await Promise.all([
     db.furnaces.count(),
     db.batches.count(),
     db.pieces.count(),
     db.steps.count(),
     db.anneals.count(),
     db.inspects.count(),
+    db.molds.count(),
   ])
-  return { furnaces, batches, pieces, steps, anneals, inspects }
+  return { furnaces, batches, pieces, steps, anneals, inspects, molds }
 }

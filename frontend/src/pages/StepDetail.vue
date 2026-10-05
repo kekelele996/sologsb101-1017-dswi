@@ -2,7 +2,9 @@
 /**
  * /pieces/:id/steps 吹制工序逐道记录
  * 拖拽排序并回填温度、时长与操作人；任一前序未完成则阻断进入退火排位。
- * 消费模型：Step、Piece、GlassBatch、Furnace；复用组件：<StageTag>、<StatBadge>、<EmptyPanel>
+ * 开模工序只能挑没报废、次数没用完的模具，挑中记下编号和当时已用次数；
+ * 开模完成时若模具已报废或用尽，退回未开始并写明原因。
+ * 消费模型：Step、Piece、GlassBatch、Furnace、Mold；复用组件：<StageTag>、<StatBadge>、<EmptyPanel>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -12,6 +14,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
+import { useMoldStore } from '@/stores/moldStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
 import { buildStepCardText, copyText } from '@/utils/export'
@@ -21,6 +24,7 @@ const route = useRoute()
 const router = useRouter()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const moldStore = useMoldStore()
 
 const pieceId = computed<string>(() => String(route.params.id ?? ''))
 const piece = computed(() => pieceStore.pieces.find((row) => row.id === pieceId.value) ?? null)
@@ -42,37 +46,47 @@ const form = reactive<StepDraft>({
   operator: '',
   remark: '',
   state: '未开始',
+  moldId: null,
 })
 
-const rules: FormRules<StepDraft> = {
+const rules = computed<FormRules<StepDraft>>(() => ({
   seq: [{ required: true, message: '请填写工序序号', trigger: 'blur' }],
   name: [{ required: true, message: '请选择工序名称', trigger: 'change' }],
   tempC: [{ required: true, message: '请填写工序温度', trigger: 'blur' }],
   durationMin: [{ required: true, message: '请填写时长', trigger: 'blur' }],
   operator: [{ required: true, message: '请填写操作人', trigger: 'blur' }],
   state: [{ required: true, message: '请选择工序状态', trigger: 'change' }],
-}
+  moldId:
+    form.name === '开模' ? [{ required: true, message: '开模工序必须选择模具', trigger: 'change' }] : [],
+}))
 
 const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
 
 const batch = computed(() =>
-  piece.value === null ? undefined : furnaceStore.batches.find((row) => row.id === piece.value?.batchId)
+  piece.value === null ? undefined : furnaceStore.batches.find((row) => row.id === piece.value?.batchId),
 )
 const furnace = computed(() =>
-  batch.value === undefined ? undefined : furnaceStore.furnaces.find((row) => row.id === batch.value?.furnaceId)
+  batch.value === undefined ? undefined : furnaceStore.furnaces.find((row) => row.id === batch.value?.furnaceId),
 )
 
 const tempCheck = computed(() =>
   piece.value === null
     ? { ok: true, message: '' }
-    : checkStepTemp(form.tempC, furnace.value?.maxTempC ?? 1250, piece.value.craft)
+    : checkStepTemp(form.tempC, furnace.value?.maxTempC ?? 1250, piece.value.craft),
 )
 
 const currentStep = computed<Step | null>(() => steps.value.find((row) => row.state !== '已完成') ?? null)
 
+/** 开模工序可选模具（未报废且次数未用完） */
+const moldOptions = computed(() => moldStore.availableMolds)
+
+/** 挂起状态：对账不平 */
+const suspended = computed(() => moldStore.suspended)
+
 onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
+  void moldStore.loadAll()
 })
 
 function openCreate(): void {
@@ -87,11 +101,17 @@ function openCreate(): void {
     operator: currentStep.value?.operator ?? '',
     remark: '',
     state: '未开始' as StepState,
+    moldId: null,
   })
   dialogVisible.value = true
 }
 
 function openEdit(row: Step): void {
+  // 只读工序不可编辑
+  if (row.readonly) {
+    ElMessage.warning('该工序为旧数据回填，模具编号缺失，只读不可编辑')
+    return
+  }
   editingId.value = row.id
   Object.assign(form, {
     pieceId: row.pieceId,
@@ -102,6 +122,7 @@ function openEdit(row: Step): void {
     operator: row.operator,
     remark: row.remark,
     state: row.state,
+    moldId: row.moldId,
   })
   dialogVisible.value = true
 }
@@ -123,6 +144,8 @@ async function handleSubmit(): Promise<void> {
       ElMessage.success('工序已更新')
     }
     dialogVisible.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '保存失败')
   } finally {
     submitting.value = false
   }
@@ -158,7 +181,7 @@ async function handleDrop(targetId: string): Promise<void> {
 
 async function handleCopyCard(): Promise<void> {
   if (piece.value === null) return
-  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [])
+  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [], moldStore.molds)
   const ok = await copyText(text)
   ElMessage[ok ? 'success' : 'warning'](ok ? '工序卡片已复制到剪贴板' : '当前浏览器不支持剪贴板写入')
 }
@@ -220,6 +243,15 @@ function goAnnealing(): void {
         />
       </div>
 
+      <el-alert
+        v-if="suspended"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        title="系统挂起：模具台账与开模道次对账不平"
+        description="开模道次合计与台账已用次数不一致，请先到模具台账核对并调整，平账后才能继续开模。"
+      />
       <el-alert
         v-if="!progress.allDone"
         type="warning"
@@ -292,10 +324,22 @@ function goAnnealing(): void {
                   {{ row.state }}
                 </el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
+                <el-tag v-if="row.readonly" size="small" type="info" effect="plain">只读（旧数据未回填模具）</el-tag>
+                <el-tag
+                  v-if="row.name === '开模' && row.moldId !== null"
+                  size="small"
+                  type="primary"
+                  effect="plain"
+                >
+                  模具 {{ moldStore.moldById(row.moldId)?.code ?? '—' }} · 已用 {{ row.moldUsedCount ?? 0 }} 次
+                </el-tag>
               </div>
               <div class="step-sub">
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
+              </div>
+              <div v-if="row.moldInvalidReason !== ''" class="step-mold-warn">
+                退回原因：{{ row.moldInvalidReason }}
               </div>
             </div>
             <div class="step-actions">
@@ -303,12 +347,12 @@ function goAnnealing(): void {
                 size="small"
                 type="primary"
                 plain
-                :disabled="row.state === '已完成'"
+                :disabled="row.state === '已完成' || row.readonly"
                 @click="handleAdvance(row)"
               >
                 推进状态
               </el-button>
-              <el-button size="small" @click="openEdit(row)">编辑</el-button>
+              <el-button size="small" :disabled="row.readonly" @click="openEdit(row)">编辑</el-button>
               <el-button size="small" type="danger" plain @click="handleDelete(row)">删除</el-button>
             </div>
           </li>
@@ -353,6 +397,28 @@ function goAnnealing(): void {
           <el-col :span="8">
             <el-form-item label="操作人" prop="operator">
               <el-input v-model="form.operator" placeholder="如：林曦" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row v-if="form.name === '开模'" :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="选择模具" prop="moldId">
+              <el-select v-model="form.moldId" filterable placeholder="只显示未报废、次数未用完的模具" style="width: 100%">
+                <el-option
+                  v-for="mold in moldOptions"
+                  :key="mold.id"
+                  :value="mold.id"
+                  :label="`${mold.code} · 已用 ${mold.usedCount}/${mold.totalCount} 次`"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="当时已用次数">
+              <el-input
+                :model-value="form.moldId === null ? '—' : String(moldStore.moldById(form.moldId)?.usedCount ?? 0)"
+                readonly
+              />
             </el-form-item>
           </el-col>
         </el-row>
@@ -465,6 +531,15 @@ function goAnnealing(): void {
 .step-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.step-mold-warn {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: #fdecea;
+  color: #c0392b;
+  font-size: 12px;
 }
 
 .step-actions {

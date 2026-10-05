@@ -1,5 +1,5 @@
 /**
- * 路由表：/furnaces、/pieces、/pieces/:id/steps、/annealing、/export
+ * 路由表：/furnaces、/pieces、/pieces/:id/steps、/annealing、/export、/molds
  * 层级路由支持直接深链访问（配合 nginx try_files 回退）；页面按路由懒加载自动分包。
  */
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
@@ -11,6 +11,7 @@ export const ROUTES = {
   steps: (pieceId: string): string => `/pieces/${pieceId}/steps`,
   annealing: '/annealing',
   export: '/export',
+  molds: '/molds',
 } as const
 
 const routes: RouteRecordRaw[] = [
@@ -38,6 +39,12 @@ const routes: RouteRecordRaw[] = [
     name: 'annealing-board',
     component: () => import('@/pages/AnnealingBoard.vue'),
     meta: { title: '退火窑位与曲线编排' },
+  },
+  {
+    path: '/molds',
+    name: 'mold-list',
+    component: () => import('@/pages/MoldList.vue'),
+    meta: { title: '模具台账与对账' },
   },
   {
     path: '/export',

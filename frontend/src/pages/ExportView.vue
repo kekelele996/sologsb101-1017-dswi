@@ -13,6 +13,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
+import { useMoldStore } from '@/stores/moldStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
 import { exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
@@ -24,6 +25,7 @@ const router = useRouter()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
 const furnaceStore = useFurnaceStore()
+const moldStore = useMoldStore()
 
 const { rows, loading, create, update, remove } = useIdbTable<Inspect>(db.inspects, { sortByUpdatedAt: false })
 
@@ -88,6 +90,7 @@ onMounted(() => {
   void pieceStore.loadAll()
   void annealStore.loadAll()
   void furnaceStore.loadAll()
+  void moldStore.loadAll()
 })
 
 function openCreate(): void {
@@ -179,19 +182,19 @@ async function handleImport(uploadFile: UploadFile): Promise<void> {
     return
   }
   await importSnapshot(result.snapshot)
-  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), moldStore.loadAll()])
   ElMessage.success(`导入成功：${result.message}`)
 }
 
 function handleReset(): void {
   ElMessageBox.confirm(
-    '全部窑炉、料液批次、作品、工序、退火与检验记录都会被清空，并重新灌入演示数据。',
+    '全部窑炉、料液批次、作品、工序、退火、检验记录与模具台账都会被清空，并重新灌入演示数据。',
     '确认重置本地数据？',
     { type: 'warning', confirmButtonText: '确认重置', cancelButtonText: '取消' },
   )
     .then(async () => {
       await resetDatabase()
-      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), moldStore.loadAll()])
       ElMessage.success('已重置为演示数据')
     })
     .catch(() => undefined)

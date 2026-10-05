@@ -22,6 +22,7 @@ import {
 } from '../utils/db'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
 import { nowIso, uuid } from '../utils/id'
+import { useMoldStore } from './moldStore'
 
 /** 作品筛选条件 */
 export interface PieceFilters {
@@ -193,8 +194,32 @@ export const usePieceStore = defineStore('piece', () => {
 
   /* ------------------------------ 工序 ------------------------------ */
 
+  /** 校验开模工序的模具是否可用；返回错误信息（空串表示通过） */
+  function validateMoldForStep(draft: StepDraft): string {
+    if (draft.name !== '开模') return ''
+    if (draft.moldId === null || draft.moldId === '') {
+      return '开模工序必须选择模具'
+    }
+    const moldStore = useMoldStore()
+    const mold = moldStore.moldById(draft.moldId)
+    if (mold === undefined) return '所选模具不存在'
+    if (mold.scrapped) return `模具「${mold.code}」已报废，不能用于开模`
+    if (mold.usedCount >= mold.totalCount) {
+      return `模具「${mold.code}」次数已用尽（${mold.usedCount}/${mold.totalCount}），不能用于开模`
+    }
+    return ''
+  }
+
   async function createStep(draft: StepDraft): Promise<Step> {
     const stamp = nowIso()
+    // 开模工序校验模具
+    const moldError = validateMoldForStep(draft)
+    if (moldError !== '') {
+      lastMessage.value = moldError
+      throw new Error(moldError)
+    }
+    const moldStore = useMoldStore()
+    const mold = draft.name === '开模' ? moldStore.moldById(draft.moldId) : undefined
     const row: Step = {
       id: uuid('step'),
       pieceId: draft.pieceId,
@@ -205,6 +230,10 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      moldId: draft.name === '开模' ? draft.moldId : null,
+      moldUsedCount: mold !== undefined ? mold.usedCount : null,
+      moldInvalidReason: '',
+      readonly: false,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -217,6 +246,19 @@ export const usePieceStore = defineStore('piece', () => {
   async function updateStep(stepId: string, draft: StepDraft): Promise<void> {
     const existing = steps.value.find((row) => row.id === stepId)
     if (existing === undefined) return
+    // 只读工序不可编辑
+    if (existing.readonly) {
+      lastMessage.value = '该工序为旧数据回填，模具编号缺失，只读不可编辑'
+      return
+    }
+    // 开模工序校验模具
+    const moldError = validateMoldForStep(draft)
+    if (moldError !== '') {
+      lastMessage.value = moldError
+      throw new Error(moldError)
+    }
+    const moldStore = useMoldStore()
+    const mold = draft.name === '开模' ? moldStore.moldById(draft.moldId) : undefined
     await putStep({
       ...existing,
       seq: draft.seq,
@@ -226,6 +268,8 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      moldId: draft.name === '开模' ? draft.moldId : null,
+      moldUsedCount: mold !== undefined ? mold.usedCount : null,
     })
     revision.value += 1
   }
@@ -240,6 +284,11 @@ export const usePieceStore = defineStore('piece', () => {
   async function advanceStep(stepId: string): Promise<void> {
     const existing = steps.value.find((row) => row.id === stepId)
     if (existing === undefined) return
+    // 只读工序不可推进
+    if (existing.readonly) {
+      lastMessage.value = '该工序为旧数据回填，模具编号缺失，只读不可推进'
+      return
+    }
     const flow: Step['state'][] = ['未开始', '进行中', '已完成']
     const index = flow.indexOf(existing.state)
     if (index < 0 || index >= flow.length - 1) {
@@ -247,6 +296,44 @@ export const usePieceStore = defineStore('piece', () => {
       return
     }
     const next = flow[index + 1]
+
+    // 开模工序推进到已完成时校验模具
+    if (next === '已完成' && existing.name === '开模' && existing.moldId !== null) {
+      const moldStore = useMoldStore()
+      const mold = moldStore.moldById(existing.moldId)
+      if (mold === undefined) {
+        // 模具不存在：退回未开始并写明原因
+        await putStep({ ...existing, state: '未开始', moldInvalidReason: '所选模具不存在' })
+        lastMessage.value = '开模完成时模具不存在，已退回未开始并写明原因'
+        return
+      }
+      if (mold.scrapped) {
+        // 模具已报废：退回未开始并写明原因
+        await putStep({ ...existing, state: '未开始', moldInvalidReason: `模具「${mold.code}」已报废` })
+        lastMessage.value = `开模完成时模具「${mold.code}」已报废，本道退回未开始并写明原因，前面确认过的工序照旧`
+        return
+      }
+      if (mold.usedCount >= mold.totalCount) {
+        // 模具次数用尽：退回未开始并写明原因
+        await putStep({
+          ...existing,
+          state: '未开始',
+          moldInvalidReason: `模具「${mold.code}」次数已用尽（${mold.usedCount}/${mold.totalCount}）`,
+        })
+        lastMessage.value = `开模完成时模具「${mold.code}」次数已用尽，本道退回未开始并写明原因，前面确认过的工序照旧`
+        return
+      }
+      // 模具有效：推进状态并递增台账已用次数
+      await putStep({ ...existing, state: next, moldInvalidReason: '' })
+      await moldStore.recordMoldUse(existing.moldId)
+      revision.value += 1
+      const piece = pieces.value.find((row) => row.id === existing.pieceId)
+      lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已推进为「${next}」${
+        piece === undefined ? '' : `（作品：${piece.name}）`
+      }`
+      return
+    }
+
     await putStep({ ...existing, state: next })
     revision.value += 1
     const piece = pieces.value.find((row) => row.id === existing.pieceId)
